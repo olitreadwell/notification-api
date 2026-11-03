@@ -10,8 +10,44 @@ from app.dao.date_util import (
     get_financial_year_for_datetime,
     get_midnight,
     get_month_start_and_end_date_in_utc,
+    get_months_for_financial_year,
+    get_months_for_year,
     get_query_date_based_on_retention_period,
 )
+
+
+def test_get_months_for_year():
+    months = get_months_for_year(4, 13, 2018)
+    assert months == [datetime(2018, month, 1) for month in range(4, 13)]
+
+
+@freeze_time("2018-09-15 12:00:00")
+def test_get_months_for_financial_year_stops_at_the_current_month():
+    months = get_months_for_financial_year(2018)
+    assert [str(month) for month in months] == [
+        "2018-04-01 04:00:00",
+        "2018-05-01 04:00:00",
+        "2018-06-01 04:00:00",
+        "2018-07-01 04:00:00",
+        "2018-08-01 04:00:00",
+        "2018-09-01 04:00:00",
+    ]
+
+
+@freeze_time("2019-02-15 12:00:00")
+def test_get_months_for_financial_year_crosses_the_calendar_year_boundary():
+    months = get_months_for_financial_year(2018)
+    assert [str(month) for month in months][-3:] == [
+        "2018-12-01 05:00:00",
+        "2019-01-01 05:00:00",
+        "2019-02-01 05:00:00",
+    ]
+    assert len(months) == 11
+
+
+@freeze_time("2016-01-01 00:00:00")
+def test_get_months_for_financial_year_returns_nothing_before_it_starts():
+    assert get_months_for_financial_year(2018) == []
 
 
 def test_get_financial_year():
