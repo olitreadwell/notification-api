@@ -30,7 +30,6 @@ from app.clients.email.aws_ses import AwsSesClient
 from app.clients.performance_platform.performance_platform_client import (
     PerformancePlatformClient,
 )
-from app.clients.salesforce.salesforce_client import SalesforceClient
 from app.clients.sms.aws_pinpoint import AwsPinpointClient
 from app.clients.sms.aws_sns import AwsSnsClient
 from app.dbsetup import RoutingSQLAlchemy, enable_sqlalchemy_debug_logging
@@ -72,7 +71,6 @@ email_queue = RedisQueue("email")
 sms_queue = RedisQueue("sms")
 performance_platform_client = PerformancePlatformClient()
 document_download_client = DocumentDownloadClient()
-salesforce_client = SalesforceClient()
 airtable_client = AirtableClient()
 
 clients = Clients()
@@ -96,6 +94,7 @@ email_priority_publish = RedisQueue("email", process_type="priority")
 
 
 def create_app(application, config=None):
+    from app.caching import init_dogpile_cache
     from app.config import configs
 
     if config is None:
@@ -126,7 +125,12 @@ def create_app(application, config=None):
     if application.config.get("OTEL_REQUEST_METRICS_ENABLED", False):
         init_otel_request_metrics(application)
     aws_sns_client.init_app(application, statsd_client=statsd_client)
-    aws_pinpoint_client.init_app(application, statsd_client=statsd_client)
+    aws_pinpoint_client.init_app(
+        application,
+        statsd_client=statsd_client,
+        dedicated_region=application.config["AWS_DEDICATED_LONG_CODES_REGION"],
+        tollfree_region=application.config["AWS_TOLL_FREE_REGION"],
+    )
     aws_ses_client.init_app(application.config["AWS_REGION"], statsd_client=statsd_client)
     notify_celery.init_app(application)
     NewsletterSubscriber.init_app(application)
@@ -146,9 +150,6 @@ def create_app(application, config=None):
     airtable_client.init_app(application)
     clients.init_app(sms_clients=[aws_sns_client, aws_pinpoint_client], email_clients=[aws_ses_client])
 
-    if application.config["FF_SALESFORCE_CONTACT"]:
-        salesforce_client.init_app(application)
-
     # Initialize the rate limiter for SMS delivery tasks, then wrap it in a
     # BufferedRateLimiter to reduce network round-trips per Celery worker.
     initialize_rate_limiter(application.config["CELERY_DELIVER_SMS_RATE_LIMIT_PER_MINUTE"], namespace="sms").buffered(
@@ -159,6 +160,11 @@ def create_app(application, config=None):
     flask_cache_ops.init_app(application)
     redis_store.init_app(application)
     bounce_rate_client.init_app(application)
+    init_dogpile_cache(application)
+    if application.config.get("FF_USE_DOGPILE_CACHING", False) is True:
+        from app.cache.cache_events import register_cache_orm_events
+
+        register_cache_orm_events()
 
     sms_bulk_publish.init_app(flask_cache_ops, metrics_logger)
     sms_normal_publish.init_app(flask_cache_ops, metrics_logger)
@@ -335,7 +341,17 @@ def register_v2_blueprints(application):
         post_template,
         v2_manage_template_blueprint,
     )
+    from app.v2.manage_template_folder import (  # noqa
+        delete_folder,
+        get_folder,
+        patch_folder,
+        post_folder,
+        v2_manage_template_folder_blueprint,
+    )
     from app.v2.notifications import (  # noqa
+        cancel_bulk_job,
+        delete_notifications,
+        get_bulk_jobs,
         get_notifications,
         post_notifications,
         v2_notification_blueprint,
@@ -360,6 +376,8 @@ def register_v2_blueprints(application):
     register_notify_blueprint(application, v2_template_blueprint, requires_auth)
 
     register_notify_blueprint(application, v2_manage_template_blueprint, requires_auth)
+
+    register_notify_blueprint(application, v2_manage_template_folder_blueprint, requires_auth)
 
     register_notify_blueprint(application, get_inbound_sms, requires_auth)
 
@@ -387,6 +405,9 @@ def init_app(app):
             "https://documentation.dev.notification.cdssandbox.xyz",
             "https://cds-snc.github.io",
         }
+        # allow the locally-run documentation site to hit this API for manual testing
+        if app.config.get("NOTIFY_ENVIRONMENT") == "development":
+            ALLOWED_ORIGINS.update({"http://localhost:8081", "http://0.0.0.0:8081"})
         origin = request.headers.get("Origin")
         if origin in ALLOWED_ORIGINS:
             response.headers["Access-Control-Allow-Origin"] = origin

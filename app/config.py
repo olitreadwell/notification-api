@@ -99,7 +99,7 @@ class QueueNames(object):
     # without affecting the short-lived periodic-tasks workers.
     NIGHTLY = "nightly-tasks"
 
-    # Queue for scheduled notifications.
+    # Queue for job processing, recovery, and status-check tasks.
     JOBS = "job-tasks"
 
     # Queue for tasks to retry.
@@ -182,9 +182,9 @@ class Config(object):
     FF_PT_SERVICE_SKIP_FRESHDESK = env.bool("FF_PT_SERVICE_SKIP_FRESHDESK", False)
     # Enables the /v2/reports API endpoints. Off by default so the feature stays hidden in production until launch.
     FF_REPORT_API = env.bool("FF_REPORT_API", False)
-    FF_SALESFORCE_CONTACT = env.bool("FF_SALESFORCE_CONTACT", False)
     FF_SMS_RATELIMIT = env.bool("FF_SMS_RATELIMIT", False)
     FF_USE_BILLABLE_UNITS = env.bool("FF_USE_BILLABLE_UNITS", False)
+    FF_USE_DOGPILE_CACHING = env.bool("FF_USE_DOGPILE_CACHING", False)
 
     # URL of admin app
     ADMIN_BASE_URL = os.getenv("ADMIN_BASE_URL", "http://localhost:6012")
@@ -226,6 +226,10 @@ class Config(object):
     EXPIRE_CACHE_TEN_MINUTES = 600
     EXPIRE_CACHE_EIGHT_DAYS = 8 * 24 * 60 * 60
 
+    # Dogpile caching
+    DOGPILE_CACHE_EXPIRATION = 600
+    DOGPILE_CACHE_BACKEND = "dogpile.cache.redis"
+
     # Performance platform
     PERFORMANCE_PLATFORM_ENABLED = False
     PERFORMANCE_PLATFORM_URL = "https://www.performance.service.gov.uk/data/govuk-notify/"
@@ -246,16 +250,7 @@ class Config(object):
         "AIRTABLE_CURRENT_NEWSLETTER_TEMPLATES_TABLE_NAME", "PROD - Current newsletter templates"
     )
 
-    # Salesforce
-    SALESFORCE_DOMAIN = os.getenv("SALESFORCE_DOMAIN")
-    SALESFORCE_CLIENT_ID = os.getenv("SALESFORCE_CLIENT_ID", "Notify")
-    SALESFORCE_ENGAGEMENT_PRODUCT_ID = os.getenv("SALESFORCE_ENGAGEMENT_PRODUCT_ID")
-    SALESFORCE_ENGAGEMENT_RECORD_TYPE = os.getenv("SALESFORCE_ENGAGEMENT_RECORD_TYPE")
-    SALESFORCE_ENGAGEMENT_STANDARD_PRICEBOOK_ID = os.getenv("SALESFORCE_ENGAGEMENT_STANDARD_PRICEBOOK_ID")
-    SALESFORCE_GENERIC_ACCOUNT_ID = os.getenv("SALESFORCE_GENERIC_ACCOUNT_ID")
-    SALESFORCE_USERNAME = os.getenv("SALESFORCE_USERNAME")
-    SALESFORCE_PASSWORD = os.getenv("SALESFORCE_PASSWORD")
-    SALESFORCE_SECURITY_TOKEN = os.getenv("SALESFORCE_SECURITY_TOKEN")
+    # Organisations
     GC_ORGANISATIONS_BUCKET_NAME = os.getenv("GC_ORGANISATIONS_BUCKET_NAME")
     GC_ORGANISATIONS_FILENAME = os.getenv("GC_ORGANISATIONS_FILENAME", "all.json")
 
@@ -291,7 +286,9 @@ class Config(object):
     AWS_SES_REGION = os.getenv("AWS_SES_REGION", "us-east-1")
     AWS_SES_ACCESS_KEY = os.getenv("AWS_SES_ACCESS_KEY")
     AWS_SES_SECRET_KEY = os.getenv("AWS_SES_SECRET_KEY")
-    AWS_PINPOINT_REGION = os.getenv("AWS_PINPOINT_REGION", "us-west-2")
+    AWS_DEDICATED_LONG_CODES_REGION = os.getenv("AWS_DEDICATED_LONG_CODES_REGION", "us-west-2")
+    AWS_TOLL_FREE_REGION = os.getenv("AWS_TOLL_FREE_REGION", "us-west-2")
+    AWS_PINPOINT_REGION = os.getenv("AWS_PINPOINT_REGION", AWS_DEDICATED_LONG_CODES_REGION)
     AWS_PINPOINT_SC_POOL_ID = os.getenv("AWS_PINPOINT_SC_POOL_ID", "")
     AWS_PINPOINT_DEFAULT_POOL_ID = os.getenv("AWS_PINPOINT_DEFAULT_POOL_ID", "")
     AWS_PINPOINT_CONFIGURATION_SET_NAME = os.getenv("AWS_PINPOINT_CONFIGURATION_SET_NAME", "pinpoint-configuration")
@@ -330,7 +327,6 @@ class Config(object):
 
     # Notify's notifications templates
     NOTIFY_SERVICE_ID = "d6aa2c68-a2d9-4437-ab19-3ae8eb202553"
-    HEARTBEAT_SERVICE_ID = "30b2fb9c-f8ad-49ad-818a-ed123fc00758"
     NEWSLETTER_SERVICE_ID = "143806ca-3068-4f5d-9c6d-276b4151a395"
     NOTIFY_USER_ID = "6af522d0-2915-4e52-83a3-3690455a5fe6"
     INVITATION_EMAIL_TEMPLATE_ID = "4f46df42-f795-4cc4-83bb-65ca312f49cc"
@@ -435,11 +431,17 @@ class Config(object):
         "app.celery.nightly_tasks",
         "app.celery.process_pinpoint_receipts_tasks",
         "app.celery.bounce_rate_tasks",
+        "app.celery.service_callback_suspension_tasks",
     )
     CELERYBEAT_SCHEDULE = {
         # app/celery/scheduled_tasks.py
         "run-scheduled-jobs": {
             "task": "run-scheduled-jobs",
+            "schedule": crontab(),
+            "options": {"queue": QueueNames.PERIODIC},
+        },
+        "send-scheduled-notifications": {
+            "task": "send-scheduled-notifications",
             "schedule": crontab(),
             "options": {"queue": QueueNames.PERIODIC},
         },
@@ -623,7 +625,7 @@ class Config(object):
 
     CONTACT_FORM_EMAIL_ADDRESS = os.getenv("CONTACT_FORM_EMAIL_ADDRESS", "helpdesk@cds-snc.ca")
     SENSITIVE_SERVICE_EMAIL = os.getenv("SENSITIVE_SERVICE_EMAIL", "ESDC.Support.CDS-SNC.Soutien.EDSC@servicecanada.gc.ca")
-    FRESHDESK_SUPPORT_EMAIL_ID = "assistance+notification@cds-snc.ca"
+    FRESHDESK_SUPPORT_EMAIL_ID = os.getenv("FRESHDESK_SUPPORT_EMAIL_ID", "assistance+notification@cds-snc.ca")
 
     FROM_NUMBER = "development"
 
@@ -632,6 +634,11 @@ class Config(object):
     STATSD_ENABLED = bool(STATSD_HOST)
 
     SENDING_NOTIFICATIONS_TIMEOUT_PERIOD = 259_200  # 3 days
+
+    # Callback retry policy: exponential backoff with jitter.
+    CALLBACK_RETRY_BACKOFF_BASE_SECONDS = env.int("CALLBACK_RETRY_BACKOFF_BASE_SECONDS", 120)
+    CALLBACK_RETRY_BACKOFF_MAX_SECONDS = env.int("CALLBACK_RETRY_BACKOFF_MAX_SECONDS", 300)
+    CALLBACK_RETRY_JITTER_FACTOR = float(os.getenv("CALLBACK_RETRY_JITTER_FACTOR", 0.2))
 
     SIMULATED_EMAIL_ADDRESSES = (
         "simulate-delivered@notification.canada.ca",
@@ -721,8 +728,6 @@ class Config(object):
             "AWS_SES_SECRET_KEY",
             "ROUTE_SECRET_KEY_1",
             "ROUTE_SECRET_KEY_2",
-            "SALESFORCE_PASSWORD",
-            "SALESFORCE_SECURITY_TOKEN",
             "TEMPLATE_PREVIEW_API_KEY",
             "DOCUMENT_DOWNLOAD_API_KEY",
             "SRE_CLIENT_SECRET",

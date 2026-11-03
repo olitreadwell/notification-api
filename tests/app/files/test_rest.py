@@ -2,13 +2,14 @@ import base64
 import json
 import uuid
 
+import pytest
 from flask import current_app, url_for
 
 from app.dao.permissions_dao import permission_dao
 from app.files.rest import _parse_scan_verdict_payload
-from app.models import FILE_STATUS_UPLOADED, FILE_STATUS_VIRUS_SCAN_FAILED
+from app.models import EMAIL_TYPE, FILE_STATUS_UPLOADED, FILE_STATUS_VIRUS_SCAN_FAILED, UPLOAD_DOCUMENT
 from tests.app.conftest import create_sample_template
-from tests.app.db import create_user
+from tests.app.db import create_service, create_template, create_user
 from tests.conftest import set_config_values
 
 MOCK_DOCUMENT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -353,22 +354,143 @@ class TestCreateFile:
         )
 
 
+def _create_attacker_service():
+    return create_service(
+        service_name=f"Attacker service {uuid.uuid4()}",
+        service_permissions=[EMAIL_TYPE, UPLOAD_DOCUMENT],
+    )
+
+
+def _create_file_payload(template_id, user_id):
+    return {
+        "template_id": str(template_id),
+        "type": "attach",
+        "name": "idor-poc-test.txt",
+        "mime_type": "text/plain",
+        "file_size": 10,
+        "file_data": base64.b64encode(b"POC file").decode("utf-8"),
+        "created_by": str(user_id),
+    }
+
+
+class TestCrossServiceAccess:
+    def test_create_file_returns_403_when_user_not_member_of_template_service(
+        self, mocker, notify_db, notify_db_session, admin_request, sample_service_full_permissions
+    ):
+        mock_upload = _mock_upload_template_attachment(mocker)
+        victim_template = create_sample_template(notify_db, notify_db_session, service=sample_service_full_permissions)
+        attacker_service = _create_attacker_service()
+
+        admin_request.post(
+            "files.create_file",
+            template_id=str(victim_template.id),
+            _data=_create_file_payload(victim_template.id, attacker_service.created_by.id),
+            _expected_status=403,
+        )
+        mock_upload.assert_not_called()
+
+    def test_create_file_ignores_template_id_in_body(
+        self, mocker, notify_db, notify_db_session, admin_request, sample_service_full_permissions
+    ):
+        _mock_upload_template_attachment(mocker)
+        victim_template = create_sample_template(notify_db, notify_db_session, service=sample_service_full_permissions)
+        attacker_service = _create_attacker_service()
+        attacker_template = create_template(attacker_service, template_type=EMAIL_TYPE)
+
+        response = admin_request.post(
+            "files.create_file",
+            template_id=str(attacker_template.id),
+            _data=_create_file_payload(victim_template.id, attacker_service.created_by.id),
+            _expected_status=201,
+        )
+        assert response["template_id"] == str(attacker_template.id)
+        assert response["service_id"] == str(attacker_service.id)
+
+
 class TestGetFile:
     def test_get_file_status(self, admin_request, sample_file):
         response = admin_request.get(
             "files.get_file_status",
             template_id=str(sample_file.template_id),
             file_id=str(sample_file.id),
+            service_id=str(sample_file.service_id),
             _expected_status=200,
         )
         assert response["status"] == sample_file.status
 
     def test_get_files_by_template_id(self, admin_request, sample_file):
-        admin_request.get(
+        response = admin_request.get(
             "files.get_files_by_template_id",
             template_id=str(sample_file.template_id),
+            service_id=str(sample_file.service_id),
             _expected_status=200,
         )
+        assert [f["id"] for f in response] == [str(sample_file.id)]
+
+
+class TestServiceScoping:
+    @pytest.mark.parametrize(
+        "method, endpoint, needs_file_id",
+        [
+            ("get", "files.get_files_by_template_id", False),
+            ("get", "files.get_file_status", True),
+            ("get", "files.get_file_contents", True),
+            ("delete", "files.delete_file", True),
+        ],
+    )
+    @pytest.mark.parametrize("service_id", [None, "not-a-uuid"], ids=["missing", "invalid"])
+    def test_returns_400_without_valid_service_id(
+        self, mocker, admin_request, sample_file, method, endpoint, needs_file_id, service_id
+    ):
+        mock_delete = mocker.patch("app.files.rest.document_download_client.delete_document")
+        kwargs = {"template_id": str(sample_file.template_id)}
+        if needs_file_id:
+            kwargs["file_id"] = str(sample_file.id)
+        if service_id:
+            kwargs["service_id"] = service_id
+
+        getattr(admin_request, method)(endpoint, _expected_status=400, **kwargs)
+        mock_delete.assert_not_called()
+
+    def test_list_returns_nothing_for_other_service(self, admin_request, sample_file):
+        response = admin_request.get(
+            "files.get_files_by_template_id",
+            template_id=str(sample_file.template_id),
+            service_id=str(_create_attacker_service().id),
+        )
+        assert response == []
+
+    def test_status_returns_none_for_other_service(self, admin_request, sample_file):
+        response = admin_request.get(
+            "files.get_file_status",
+            template_id=str(sample_file.template_id),
+            file_id=str(sample_file.id),
+            service_id=str(_create_attacker_service().id),
+        )
+        assert response == {"status": None}
+
+    def test_download_returns_404_for_other_service(self, mocker, admin_request, sample_file):
+        mock_download = mocker.patch("app.files.rest.document_download_client.download_document")
+        admin_request.get(
+            "files.get_file_contents",
+            template_id=str(sample_file.template_id),
+            file_id=str(sample_file.id),
+            service_id=str(_create_attacker_service().id),
+            _expected_status=404,
+        )
+        mock_download.assert_not_called()
+
+    def test_delete_returns_404_for_other_service(self, mocker, admin_request, sample_file):
+        mock_delete = mocker.patch("app.files.rest.document_download_client.delete_document")
+        admin_request.delete(
+            "files.delete_file",
+            template_id=str(sample_file.template_id),
+            file_id=str(sample_file.id),
+            service_id=str(_create_attacker_service().id),
+            _expected_status=404,
+        )
+        mock_delete.assert_not_called()
+        assert sample_file.archived is False
 
 
 SCAN_VERDICT_TOKEN = "test-scan-verdict-token"
@@ -476,6 +598,7 @@ class TestDeleteFile:
             "files.delete_file",
             template_id=str(sample_file.template_id),
             file_id=str(sample_file.id),
+            service_id=str(sample_file.service_id),
             _expected_status=204,
         )
 
@@ -491,7 +614,7 @@ class TestDeleteFile:
         # Verify archived file no longer appears in the template's file list
         from app.dao.files_dao import dao_get_files_by_template_id
 
-        visible_files = dao_get_files_by_template_id(sample_file.template_id)
+        visible_files = dao_get_files_by_template_id(sample_file.template_id, sample_file.service_id)
         assert all(f.id != sample_file.id for f in visible_files)
 
     def test_delete_file_returns_404_when_template_file_mismatch(
@@ -506,6 +629,7 @@ class TestDeleteFile:
             "files.delete_file",
             template_id=str(different_template.id),
             file_id=str(sample_file.id),
+            service_id=str(sample_file.service_id),
             _expected_status=404,
         )
 
@@ -524,6 +648,7 @@ class TestDeleteFile:
             "files.delete_file",
             template_id=str(sample_file.template_id),
             file_id=str(sample_file.id),
+            service_id=str(sample_file.service_id),
             _expected_status=500,
         )
 

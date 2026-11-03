@@ -18,13 +18,7 @@ from app import (
     authenticated_service,
     create_uuid,
     document_download_client,
-    email_bulk_publish,
-    email_normal_publish,
-    email_priority_publish,
     signer_notification,
-    sms_bulk_publish,
-    sms_normal_publish,
-    sms_priority_publish,
     statsd_client,
 )
 from app.annual_limit_utils import get_annual_limit_notifications_v2
@@ -41,18 +35,15 @@ from app.dao.templates_dao import get_precompiled_letter_template
 from app.email_limit_utils import fetch_todays_email_count
 from app.encryption import NotificationDictToSign
 from app.models import (
-    BULK,
     EMAIL_TYPE,
     JOB_STATUS_PENDING,
     JOB_STATUS_SCHEDULED,
     KEY_TYPE_TEAM,
     KEY_TYPE_TEST,
     LETTER_TYPE,
-    NORMAL,
     NOTIFICATION_CREATED,
     NOTIFICATION_DELIVERED,
     NOTIFICATION_SENDING,
-    PRIORITY,
     SMS_TYPE,
     UPLOAD_DOCUMENT,
     ApiKey,
@@ -70,6 +61,7 @@ from app.notifications.process_notifications import (
     persist_scheduled_notification,
     simulated_recipient,
     transform_notification,
+    triage_notification_to_queues,
 )
 from app.notifications.validators import (
     check_email_annual_limit,
@@ -364,6 +356,12 @@ def post_notification(notification_type: NotificationType):
         if not is_test_notification:
             # TODO FF_USE_BILLABLE_UNITS removal - Use billable_units when feature flag is enabled
             increment_by = notification.billable_units if current_app.config.get("FF_USE_BILLABLE_UNITS") else 1
+            if increment_by is None:
+                current_app.logger.info(
+                    f"Billable units is None for notification {getattr(notification, 'id', None)}, template {template.id}"
+                )
+                increment_by = 1
+
             increment_sms_daily_count_send_warnings_if_needed(authenticated_service, increment_by)
 
     if notification_type == SMS_TYPE:
@@ -391,33 +389,6 @@ def post_notification(notification_type: NotificationType):
         scheduled_for=scheduled_for,
     )
     return jsonify(resp), 201
-
-
-def triage_notification_to_queues(notification_type: NotificationType, signed_notification_data, template: Template):
-    """Determine which queue to use based on notification_type and process_type
-
-    Args:
-        notification_type: Type of notification being sent; either SMS_TYPE or EMAIL_TYPE
-        signed_notification_data: Encrypted notification data
-        template: Template used to send notification
-    Returns:
-        None
-
-    """
-    if notification_type == SMS_TYPE:
-        if template.process_type == PRIORITY:
-            sms_priority_publish.publish(signed_notification_data)
-        elif template.process_type == NORMAL:
-            sms_normal_publish.publish(signed_notification_data)
-        elif template.process_type == BULK:
-            sms_bulk_publish.publish(signed_notification_data)
-    elif notification_type == EMAIL_TYPE:
-        if template.process_type == PRIORITY:
-            email_priority_publish.publish(signed_notification_data)
-        elif template.process_type == NORMAL:
-            email_normal_publish.publish(signed_notification_data)
-        elif template.process_type == BULK:
-            email_bulk_publish.publish(signed_notification_data)
 
 
 def process_sms_or_email_notification(
@@ -539,6 +510,25 @@ def process_document_uploads(personalisation_data, service: Service, simulated, 
         else:
             try:
                 personalisation_data[key] = document_download_client.upload_document(service.id, personalisation_data[key])
+                uploaded_document = personalisation_data[key]["document"]
+                current_app.logger.info(
+                    "File upload accepted: service_id=%s template_id=%s filename=%s file_extension=%s "
+                    "mime_type=%s sending_method=%s",
+                    service.id,
+                    template_id,
+                    uploaded_document.get("filename"),
+                    uploaded_document.get("file_extension"),
+                    uploaded_document.get("mime_type"),
+                    uploaded_document.get("sending_method"),
+                    extra={
+                        "service_id": str(service.id),
+                        "template_id": str(template_id),
+                        "file_name": uploaded_document.get("filename"),
+                        "file_extension": uploaded_document.get("file_extension"),
+                        "mime_type": uploaded_document.get("mime_type"),
+                        "sending_method": uploaded_document.get("sending_method"),
+                    },
+                )
             except DocumentDownloadError as e:
                 raise BadRequestError(message=e.message, status_code=e.status_code)
 

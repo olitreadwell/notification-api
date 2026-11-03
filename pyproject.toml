@@ -28,10 +28,11 @@ celery = {extras = ["sqs"], version = "5.6.3"}
 kombu = { git = "https://github.com/celery/kombu.git", rev = "860e40a6c904c4d8551577d9f4e8c00f03b6e06c" }
 
 # Pinned dependencies
-certifi = "^2024.0.0" # pinned for security reasons: https://github.com/cds-snc/notification-api/security/dependabot/119
+certifi = "^2026.10.19" # pinned for security reasons: CA bundle update (CVE-2026-111943)
 cffi = "2.0.0"
 click-datetime = "0.2"
 docopt = "0.6.2"
+dogpile-cache = { version = "^1.3", extras = ["redis"] }
 environs = "9.5.0"       # pyup: <9.3.3 # marshmallow v3 throws errors"
 fido2 = "^2.2.0"
 #git+https://github.com/mitsuhiko/flask-sqlalchemy.git@500e732dd1b975a56ab06a46bd1a20a21e682262#egg=Flask-SQLAlchemy==2.3.2.dev20190108
@@ -61,7 +62,7 @@ opentelemetry-instrumentation-celery = "0.55b1"
 opentelemetry-instrumentation-flask = "0.55b1"
 opentelemetry-instrumentation-redis = "0.55b1"
 opentelemetry-instrumentation-sqlalchemy = "0.55b1"
-notifications-utils = { git = "https://github.com/cds-snc/notifier-utils.git", tag="53.2.34"}
+notifications-utils = { git = "https://github.com/cds-snc/notifier-utils.git", tag="53.2.35"}
 pre-commit = "^3.7.1"
 psycopg2-binary = "2.9.11"
 pwnedpasswords = "2.0.0"
@@ -72,7 +73,6 @@ python-dotenv = "1.2.2"
 python-magic = "0.4.27"
 pytz = "2021.3"
 PyYAML = "6.0.3"
-simple-salesforce = "^1.12.3"
 SQLAlchemy = "1.4.54"
 tldextract = "3.5.0"
 types-psycopg2 = "^2.9.21.20250516"
@@ -83,6 +83,7 @@ unidecode = "1.3.8"
 Werkzeug = "3.1.6"
 
 [tool.poetry.group.test.dependencies]
+brotli = "1.2.1" # not directly required (locust -> geventhttpclient), pinned to fix CVE-2026-111497
 coveralls = "3.3.1"
 fakeredis = { version = "2.35.1", extras = ["lua"] }
 freezegun = "1.5.5"

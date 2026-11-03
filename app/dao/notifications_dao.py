@@ -354,6 +354,17 @@ def get_notification_by_id(notification_id, service_id=None, _raise=False) -> No
     return query.one() if _raise else query.first()
 
 
+@statsd(namespace="dao")
+def get_notification_with_template(notification_id: str) -> Notification | None:
+    return (
+        db.on_reader()
+        .query(Notification)
+        .filter(Notification.id == notification_id)
+        .options(joinedload("template").joinedload("template_category"))
+        .first()
+    )
+
+
 def get_notifications(filter_dict=None):
     return _filter_query(Notification.query, filter_dict=filter_dict)
 
@@ -553,6 +564,24 @@ def dao_delete_notifications_by_id(notification_id):
     db.session.query(Notification).filter(Notification.id == notification_id).delete(synchronize_session="fetch")
 
 
+@statsd(namespace="dao")
+@transactional
+def dao_delete_scheduled_notification_by_id(notification_id):
+    # Only deletes notifications that are still pending, atomically, so callers can rely on the
+    # returned count to detect a race where the notification was sent in the meantime, and so
+    # this method can't be misused to delete non-scheduled/already-sent notifications.
+    deleted_count = (
+        db.session.query(ScheduledNotification)
+        .filter(ScheduledNotification.notification_id == notification_id, ScheduledNotification.pending.is_(True))
+        .delete(synchronize_session="fetch")
+    )
+
+    if deleted_count:
+        db.session.query(Notification).filter(Notification.id == notification_id).delete(synchronize_session="fetch")
+
+    return deleted_count
+
+
 def _timeout_notifications(current_statuses, new_status, timeout_start, updated_at):
     notifications = Notification.query.filter(
         Notification.created_at < timeout_start,
@@ -730,9 +759,11 @@ def dao_created_scheduled_notification(scheduled_notification):
 
 @statsd(namespace="dao")
 def dao_get_scheduled_notifications():
+    """Legacy rows, whose notification is already in the notifications table, that are due to be sent."""
     notifications = (
-        Notification.query.join(ScheduledNotification)
+        Notification.query.join(Notification.scheduled_notification)
         .filter(
+            ScheduledNotification.service_id.is_(None),
             ScheduledNotification.scheduled_for < datetime.utcnow(),
             ScheduledNotification.pending,
         )
@@ -742,9 +773,9 @@ def dao_get_scheduled_notifications():
     return notifications
 
 
-def set_scheduled_notification_to_processed(notification_id):
-    db.session.query(ScheduledNotification).filter(ScheduledNotification.notification_id == notification_id).update(
-        {"pending": False}
+def dao_delete_scheduled_notification_by_notification_id(notification_id):
+    db.session.query(ScheduledNotification).filter(ScheduledNotification.notification_id == notification_id).delete(
+        synchronize_session=False
     )
     db.session.commit()
 
@@ -783,7 +814,13 @@ def dao_get_total_notifications_sent_per_day_for_performance_platform(start_date
 
 @statsd(namespace="dao")
 def get_latest_sent_notification_for_job(job_id):
-    return Notification.query.filter(Notification.job_id == job_id).order_by(Notification.updated_at.desc()).limit(1).first()
+    # Postgres sorts NULLs first in DESC order, which would wipe the job's updated_at
+    return (
+        Notification.query.filter(Notification.job_id == job_id, Notification.updated_at.isnot(None))
+        .order_by(Notification.updated_at.desc())
+        .limit(1)
+        .first()
+    )
 
 
 @statsd(namespace="dao")

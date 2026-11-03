@@ -342,6 +342,11 @@ def increment_sms_daily_count_send_warnings_if_needed(service: Service, requeste
     if not current_app.config["REDIS_ENABLED"]:
         return
 
+    # Redis INCRBY requires a numeric amount; treat a missing billable-unit count as one SMS.
+    if requested_sms is None:
+        current_app.logger.info(f"SMS billable_units was None; defaulting requested_count to 1 for service: {service.id}")
+        requested_sms = 1
+
     # TODO FF_USE_BILLABLE_UNITS removal - Increment billable units when feature flag is enabled
     if current_app.config.get("FF_USE_BILLABLE_UNITS"):
         increment_todays_requested_sms_billable_units_count(service.id, requested_sms)
@@ -709,9 +714,17 @@ def decode_personalisation_files(json_personalisation):
     file_keys = [k for k, v in json_personalisation.items() if isinstance(v, dict) and "file" in v]
     for key in file_keys:
         try:
-            json_personalisation[key]["file"] = base64.b64decode(json_personalisation[key]["file"])
+            json_personalisation[key]["file"] = base64.b64decode(json_personalisation[key]["file"], validate=True)
             personalisation_size = len(json_personalisation[key]["file"])
             current_app.logger.debug(f"File size detected at {personalisation_size} bytes.")
+            if personalisation_size == 0:
+                errors.append(
+                    {
+                        "error": "ValidationError",
+                        "message": f"{key} : File cannot be empty",
+                    }
+                )
+                continue
             size_limit = current_app.config["ATTACHMENT_SIZE_LIMIT"]
             if personalisation_size > size_limit:
                 filename = json_personalisation[key]["filename"]

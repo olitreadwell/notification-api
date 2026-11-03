@@ -1214,9 +1214,17 @@ class TestSendingDocuments:
         template = create_template(service=service, template_type="email", content=content)
 
         statsd_mock = mocker.patch("app.v2.notifications.post_notifications.statsd_client")
+        logger_mock = mocker.patch("app.v2.notifications.post_notifications.current_app.logger.info")
         mock_publish = mocker.patch("app.email_normal_publish.publish")
         document_download_mock = mocker.patch("app.v2.notifications.post_notifications.document_download_client.upload_document")
-        document_response = document_download_response({"sending_method": sending_method, "mime_type": "text/plain"})
+        document_response = document_download_response(
+            {
+                "filename": filename,
+                "file_extension": "txt",
+                "sending_method": sending_method,
+                "mime_type": "text/plain",
+            }
+        )
         document_download_mock.return_value = document_response
         decoded_file = base64.b64decode(file_data)
 
@@ -1245,6 +1253,27 @@ class TestSendingDocuments:
         document_download_mock.assert_called_once_with(
             service.id,
             {"file": decoded_file, "filename": filename, "sending_method": sending_method},
+        )
+        assert (
+            call(
+                "File upload accepted: service_id=%s template_id=%s filename=%s file_extension=%s "
+                "mime_type=%s sending_method=%s",
+                service.id,
+                template.id,
+                filename,
+                "txt",
+                "text/plain",
+                sending_method,
+                extra={
+                    "service_id": str(service.id),
+                    "template_id": str(template.id),
+                    "file_name": filename,
+                    "file_extension": "txt",
+                    "mime_type": "text/plain",
+                    "sending_method": sending_method,
+                },
+            )
+            in logger_mock.call_args_list
         )
 
         mock_publish_args = mock_publish.call_args.args[0]
@@ -1580,10 +1609,12 @@ class TestSendingDocuments:
         assert f"personalisation {sending_method} is not one of [attach, link]" in resp_json["errors"][0]["message"]
 
     @pytest.mark.parametrize(
-        "file_data, message",
+        "file_data, expected_message",
         [
-            ("abc", "Incorrect padding"),
-            ("🤡", "string argument should contain only ASCII characters"),
+            ("abc", "document : Incorrect padding : Error decoding base64 field"),
+            ("YWJj$%", "document : Only base64 data is allowed : Error decoding base64 field"),
+            ("🤡", "document : string argument should contain only ASCII characters : Error decoding base64 field"),
+            ("", "document : File cannot be empty"),
         ],
     )
     def test_post_notification_with_document_upload_not_base64_file(
@@ -1591,7 +1622,7 @@ class TestSendingDocuments:
         client,
         notify_db_session,
         file_data,
-        message,
+        expected_message,
         mock_annual_limits,
     ):
         service = create_service(service_permissions=[EMAIL_TYPE, UPLOAD_DOCUMENT])
@@ -1618,7 +1649,7 @@ class TestSendingDocuments:
 
         assert response.status_code == 400
         resp_json = json.loads(response.get_data(as_text=True))
-        assert f"{message} : Error decoding base64 field" in resp_json["errors"][0]["message"]
+        assert resp_json["errors"][0]["message"] == expected_message
 
     def test_post_notification_with_document_upload_simulated(self, client, notify_db_session, mocker, mock_annual_limits):
         service = create_service(service_permissions=[EMAIL_TYPE, UPLOAD_DOCUMENT])

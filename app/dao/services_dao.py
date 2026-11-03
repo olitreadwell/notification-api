@@ -11,6 +11,8 @@ from sqlalchemy.orm import joinedload
 from sqlalchemy.sql.expression import and_, asc, case, func
 
 from app import db, redis_store
+from app.annotations import log_execution_time
+from app.caching import cache_on_arguments
 from app.dao.dao_utils import VersionOptions, transactional, version_class
 from app.dao.date_util import get_current_financial_year, get_midnight
 from app.dao.email_branding_dao import dao_get_email_branding_by_name
@@ -40,6 +42,7 @@ from app.models import (
     NotificationHistory,
     Organisation,
     Permission,
+    ScheduledNotification,
     Service,
     ServicePermission,
     ServiceSmsSender,
@@ -50,6 +53,7 @@ from app.models import (
     User,
     VerifyCode,
 )
+from app.schemas import service_schema
 from app.service.utils import add_pt_data_retention, get_organisation_by_id
 from app.utils import (
     email_address_is_nhs,
@@ -88,7 +92,7 @@ def dao_count_live_services():
     ).count()
 
 
-def dao_fetch_live_services_data(filter_heartbeats=None):
+def dao_fetch_live_services_data():
     year_start_date, year_end_date = get_current_financial_year()
 
     most_recent_annual_billing = (
@@ -180,11 +184,9 @@ def dao_fetch_live_services_data(filter_heartbeats=None):
             AnnualBilling.free_sms_fragment_limit,
         )
         .order_by(asc(Service.go_live_at))
+        .all()
     )
 
-    if filter_heartbeats:
-        data = data.filter(Service.id != current_app.config["NOTIFY_SERVICE_ID"])
-    data = data.all()
     results = []
     for row in data:
         existing_service = next((x for x in results if x["service_id"] == row.service_id), None)
@@ -198,6 +200,19 @@ def dao_fetch_live_services_data(filter_heartbeats=None):
     return results
 
 
+@cache_on_arguments(namespace="service", group_by="service_id")
+def dao_fetch_service_by_id_cached(service_id: str, only_active=False) -> dict:
+    """Dogpile cached version of fetching a service by id"""
+    query = Service.query.filter_by(id=service_id).options(joinedload("users"))
+    if only_active:
+        query = query.filter(Service.active)
+
+    service = service_schema.dump(query.one())
+
+    return service
+
+
+@log_execution_time
 def dao_fetch_service_by_id(service_id, only_active=False, use_cache=False) -> Service:
     if use_cache:
         service_cache = redis_store.get(service_cache_key(service_id))
@@ -425,6 +440,10 @@ def delete_service_and_all_associated_db_objects(service):
     _delete_commit(InvitedUser.query.filter_by(service=service))
     _delete_commit(Permission.query.filter_by(service=service))
     _delete_commit(NotificationHistory.query.filter_by(service=service))
+    _delete_commit(ScheduledNotification.query.filter_by(service_id=service.id))
+    # Legacy rows don't have service_id set, they're linked to the service's notifications
+    notifications_subq = db.session.query(Notification.id).filter_by(service=service)
+    _delete_commit(ScheduledNotification.query.filter(ScheduledNotification.notification_id.in_(notifications_subq)))
     _delete_commit(Notification.query.filter_by(service=service))
     _delete_commit(Job.query.filter_by(service=service))
     _delete_commit(Template.query.filter_by(service=service))

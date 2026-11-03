@@ -172,7 +172,7 @@ def fetch_notification_status_for_service_by_month(start_date, end_date, service
     )
 
 
-def fetch_delivered_notification_stats_by_month(filter_heartbeats=None):
+def fetch_delivered_notification_stats_by_month():
     """
     Fetch delivered/sent notification stats by month from the summary table.
     This is much faster than querying the 28M+ row ft_notification_status table.
@@ -198,10 +198,6 @@ def fetch_delivered_notification_stats_by_month(filter_heartbeats=None):
             FactNotificationStatus.notification_type,
         )
     )
-    if filter_heartbeats:
-        query = query.filter(
-            FactNotificationStatus.service_id.notin_([...])  # Excludes 2 services
-        )
     return query.all()
 
     But now we store the results of this query in MonthlyNotificationStatsSummary. We only store
@@ -216,24 +212,17 @@ def fetch_delivered_notification_stats_by_month(filter_heartbeats=None):
             MonthlyNotificationStatsSummary.notification_type,
             func.sum(MonthlyNotificationStatsSummary.notification_count).label("count"),
         )
+        .join(Service, Service.id == MonthlyNotificationStatsSummary.service_id)
         .filter(
             MonthlyNotificationStatsSummary.month >= "2019-11-01",  # GC Notify start date
+            Service.count_as_live.is_(True),
+            Service.restricted.is_(False),
         )
         .group_by(
             MonthlyNotificationStatsSummary.month,
             MonthlyNotificationStatsSummary.notification_type,
         )
     )
-
-    if filter_heartbeats:
-        query = query.filter(
-            MonthlyNotificationStatsSummary.service_id.notin_(
-                [
-                    current_app.config["NOTIFY_SERVICE_ID"],
-                    current_app.config["HEARTBEAT_SERVICE_ID"],
-                ]
-            ),
-        )
 
     return query.order_by(
         MonthlyNotificationStatsSummary.month.desc(),
