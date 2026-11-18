@@ -24,8 +24,8 @@ from app.dao.jobs_dao import (
 from app.dao.notifications_dao import get_notifications_for_job
 from app.dao.services_dao import dao_fetch_service_by_id
 from app.dao.templates_dao import dao_get_template_by_id
-from app.email_limit_utils import decrement_todays_email_count
 from app.errors import InvalidRequest, register_errors
+from app.job.daily_limits import release_daily_limit_for_cancelled_job
 from app.models import (
     EMAIL_TYPE,
     JOB_STATUS_CANCELLED,
@@ -78,7 +78,7 @@ def cancel_job(service_id, job_id):
     job = dao_get_future_scheduled_job_by_id_and_service_id(job_id, service_id)
     job.job_status = JOB_STATUS_CANCELLED
     dao_update_job(job)
-    decrement_todays_email_count(service_id, job.notification_count)
+    release_daily_limit_for_cancelled_job(job)
     return get_job_by_service_and_job_id(service_id, job_id)
 
 
@@ -217,14 +217,11 @@ def create_job(service_id):
         sms_billable_units = 0
         # Check and track limits if we're not sending test notifications
         if has_real_recipients and not has_simulated:
-            csv_length = len(recipient_csv)
             sms_billable_units = recipient_csv.sms_fragment_count
-            # TODO FF_USE_BILLABLE_UNITS removal - Use billable units when feature flag is enabled
-            requested_sms = sms_billable_units if current_app.config.get("FF_USE_BILLABLE_UNITS") else csv_length
-            check_sms_annual_limit(service, requested_sms)
-            check_sms_daily_limit(service, requested_sms)
+            check_sms_annual_limit(service, sms_billable_units)
+            check_sms_daily_limit(service, sms_billable_units)
             if count_towards_todays_limit:
-                increment_sms_daily_count_send_warnings_if_needed(service, requested_sms)
+                increment_sms_daily_count_send_warnings_if_needed(service, sms_billable_units)
 
     elif template.template_type == EMAIL_TYPE:
         if "notification_count" in data:
